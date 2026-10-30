@@ -91,17 +91,21 @@ rc=0
 while read -r period run input; do
   echo "== $period $run"
   for s in $SCRIPTS; do
+    args=""
     case $s in
-      eta)    script=$REPO_DIR/eta/find_eta.py;       out=$OUTDIR/eta_$run;    finished=${out}_eta.parquet ;;
-      lambda) script=$REPO_DIR/lambda/find_lambda.py; out=$OUTDIR/lambda_$run; finished=${out}.parquet ;;
+      eta)    script=$REPO_DIR/eta/find_eta.py;       out=$OUTDIR/eta_$run;    finished=${out}_eta_pippimg.parquet ;;
+      lambda) script=$REPO_DIR/lambda/find_lambda.py; out=$OUTDIR/lambda_$run; finished=${out}_ekg.parquet
+              # missing masses need the beam energy, taken from periods.py
+              beam=$(python3 "$REPO_DIR/periods.py" --beam "$period") || { echo "  no beam energy for $period" >&2; rc=1; continue; }
+              args="--beam-energy $beam" ;;
     esac
     # the last file a script writes tells whether it finished
     if [ -s "$finished" ] && [ "$FORCE" != 1 ]; then
       echo "  $s already done, skipping"
       continue
     fi
-    echo "  python3 $script $input $out"
-    python3 "$script" "$input" "$out" || { echo "  $s FAILED for run $run" >&2; rc=1; }
+    echo "  python3 $script $input $out $args"
+    python3 "$script" "$input" "$out" $args || { echo "  $s FAILED for run $run" >&2; rc=1; }
   done
 done < <(sed -n "${first},${last}p" "$RUNLIST")
 

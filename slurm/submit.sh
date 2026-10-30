@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --ntasks=1
-#SBATCH --job-name=eta_meson
+#SBATCH --job-name=exclusive_reaction_job
 #SBATCH --output=/farm_out/%u/%x-%A_%a.out
 #SBATCH --error=/farm_out/%u/%x-%A_%a.err
 #SBATCH --partition=production

@@ -28,7 +28,7 @@ beam_energy = {
     "sp18_inb":      10.59,
     "sp18_outb":     10.59,
     "fall2018_inb":  10.604,
-    "fall2018_outb": 10.6,
+    "fall2018_outb": 10.604,
 }
 
 

@@ -249,12 +249,24 @@ def save_df(df, base):
     print(f"saved {len(df)} rows -> {path}")
 
 
+def _already_done(base):
+    """True if every output file of this script already exists and is not empty."""
+    def present(stem):
+        return any(os.path.exists(stem + ext) and os.path.getsize(stem + ext) > 0 for ext in (".parquet", ".pkl"))
+    return all(present(f"{base}_{name}") for name in COLUMNS)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input", help="input HIPO file")
     ap.add_argument("output", help="output prefix, gives <output>_ekppim.parquet, <output>_ekp.parquet, ...")
     ap.add_argument("--beam-energy", type=float, required=True, help="beam energy in GeV, see periods.py")
+    ap.add_argument("--force", action="store_true", help="run even if all output files already exist")
     args = ap.parse_args()
+
+    if not args.force and _already_done(args.output):
+        print(f"all output files of {args.output} already exist, nothing to do (--force to redo)")
+        return
 
     outdir = os.path.dirname(args.output)
     if outdir:

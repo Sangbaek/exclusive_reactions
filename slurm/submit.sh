@@ -14,6 +14,7 @@
 #   ./slurm/submit.sh             on a login node, builds the run list and submits the array
 #   ./slurm/submit.sh --dry-run   builds the run list, prints what would be submitted
 #   FORCE=1 ./slurm/submit.sh     redo runs whose output already exists
+#   MISSING=1 ./slurm/submit.sh   only submit runs with missing or partial output (see slurm/check_output.py)
 # Every array task (SLURM_ARRAY_TASK_ID is set) takes its chunk of runs and runs the selected scripts on each.
 # In the log names %A is the array's master job ID and %a is the task (chunk) number.
 # Any setting below can also be given on the command line, e.g.  SCRIPTS=eta PERIODS=sp18_inb ./slurm/submit.sh
@@ -21,10 +22,11 @@
 # ---- configuration ----------------------------------------------------------
 SCRIPTS=${SCRIPTS:-"eta lambda"}     # which analysis scripts to run, eta and/or lambda
 PERIODS=${PERIODS:-""}               # empty means every period in periods.py, e.g. "sp18_inb fall2018_inb"
-RUNS_PER_CHUNK=${RUNS_PER_CHUNK:-10}
+RUNS_PER_CHUNK=${RUNS_PER_CHUNK:-1}       # runs per array task, 1 gives one job per file
 OUTDIR=${OUTDIR:-/volatile/clas12/sangbaek/exclusive_reactions}
 ENV_SETUP=${ENV_SETUP:-""}           # file to source first, must provide ROOT with hipo, pandas, awkward, pyarrow
 FORCE=${FORCE:-0}
+MISSING=${MISSING:-0}                # 1 submits only the runs whose output is missing or incomplete
 # -----------------------------------------------------------------------------
 
 if [ -z "${SLURM_ARRAY_TASK_ID:-}" ]; then
@@ -43,8 +45,31 @@ if [ -z "${SLURM_ARRAY_TASK_ID:-}" ]; then
   mkdir -p "$OUTDIR/runlists"
   RUNLIST=$OUTDIR/runlists/runs_$(date +%Y%m%d_%H%M%S).txt
   python3 "$REPO_DIR/periods.py" $PERIODS > "$RUNLIST" || { echo "building the run list failed" >&2; rm -f "$RUNLIST"; exit 1; }
+  # Runs that slurm/merge_output.py has merged for every selected script are not submitted again.
+  SKIPPED=0
+  DONELIST=$OUTDIR/merged/done_runs.txt
+  if [ -s "$DONELIST" ] && [ "$FORCE" != 1 ]; then
+    BEFORE=$(wc -l < "$RUNLIST")
+    awk -v scripts="$SCRIPTS" 'BEGIN { n = split(scripts, sc, " ") }
+      NR == FNR { d[$1" "$2] = 1; next }
+      { ok = 1; for (i = 1; i <= n; i++) if (!((sc[i]" "$2) in d)) ok = 0; if (!ok) print }' "$DONELIST" "$RUNLIST" > "$RUNLIST.tmp"
+    mv "$RUNLIST.tmp" "$RUNLIST"
+    SKIPPED=$(( BEFORE - $(wc -l < "$RUNLIST") ))
+    echo "skipping         $SKIPPED runs already merged (listed in $DONELIST)"
+  fi
+  if [ "$MISSING" = 1 ]; then
+    # keep only the runs that check_output.py reports as missing or partial for the selected scripts
+    REDO=$(python3 "$REPO_DIR/slurm/check_output.py" $PERIODS --scripts $SCRIPTS --outdir "$OUTDIR" --list) || true
+    echo "$REDO" | awk 'NF==3 {print $2, $3}' | sort -u > "$RUNLIST.redo"
+    echo "$REDO" | awk 'NF==3 {s[$2" "$3]=s[$2" "$3]" "$1} END {for (k in s) print k, s[k]}' | sort > "$RUNLIST.scripts"
+    awk 'NR==FNR {redo[$1" "$2]=1; next} (($1" "$2) in redo)' "$RUNLIST.redo" "$RUNLIST" > "$RUNLIST.tmp"
+    mv "$RUNLIST.tmp" "$RUNLIST"; rm -f "$RUNLIST.redo"
+  fi
   NRUNS=$(wc -l < "$RUNLIST")
-  [ "$NRUNS" -gt 0 ] || { echo "no runs found" >&2; exit 1; }
+  if [ "$NRUNS" -eq 0 ]; then
+    { [ "$MISSING" = 1 ] || [ "$SKIPPED" -gt 0 ]; } && { echo "nothing left to run, no job submitted"; rm -f "$RUNLIST"; exit 0; }
+    echo "no runs found" >&2; exit 1
+  fi
   NCHUNKS=$(( (NRUNS + RUNS_PER_CHUNK - 1) / RUNS_PER_CHUNK ))
 
   echo "scripts          $SCRIPTS"
@@ -70,10 +95,19 @@ if [ -z "${SLURM_ARRAY_TASK_ID:-}" ]; then
   echo "batch script     $BATCH"
 
   if [ "${1:-}" = "--dry-run" ]; then
+    echo
+    echo "runs to submit (task, period, run, scripts that will run; finished scripts are skipped by the worker)"
+    awk -v per="$RUNS_PER_CHUNK" -v all="$SCRIPTS" -v sf="$RUNLIST.scripts" '
+      BEGIN { while ((getline l < sf) > 0) { split(l, a, " "); k = a[1]" "a[2]; sub(/^[^ ]+ [^ ]+ /, "", l); need[k] = l } }
+      { k = $1" "$2; printf "  task %d  %s %s  %s\n", int((NR - 1) / per) + 1, $1, $2, (k in need ? need[k] : all) }
+    ' "$RUNLIST"
+    echo
     echo "would run: sbatch --array=1-$NCHUNKS $BATCH"
+    rm -f "$RUNLIST.scripts"
     exit 0
   fi
   mkdir -p "/farm_out/$(id -un)" 2>/dev/null   # slurm drops the logs silently if this is missing
+  rm -f "$RUNLIST.scripts"
   exec sbatch --array=1-"$NCHUNKS" "$BATCH"
 fi
 
@@ -88,7 +122,9 @@ last=$(( SLURM_ARRAY_TASK_ID * RUNS_PER_CHUNK ))
 echo "run list lines $first to $last of $RUNLIST"
 
 rc=0
-while read -r period run input; do
+# The run list is read on fd 3 and the analysis commands get /dev/null as stdin.
+# Otherwise a command that reads stdin (ROOT can) swallows the rest of the list and only the first run is processed.
+while read -r period run input <&3; do
   echo "== $period $run"
   for s in $SCRIPTS; do
     args=""
@@ -99,15 +135,16 @@ while read -r period run input; do
               beam=$(python3 "$REPO_DIR/periods.py" --beam "$period") || { echo "  no beam energy for $period" >&2; rc=1; continue; }
               args="--beam-energy $beam" ;;
     esac
-    # the last file a script writes tells whether it finished
-    if [ -s "$finished" ] && [ "$FORCE" != 1 ]; then
+    # Finished means the last file the script writes exists, or the run is in the list that
+    # slurm/merge_output.py keeps of merged runs (their per-run files may have been deleted).
+    if { [ -s "$finished" ] || grep -qxF "$s $run" "$OUTDIR/merged/done_runs.txt" 2>/dev/null; } && [ "$FORCE" != 1 ]; then
       echo "  $s already done, skipping"
       continue
     fi
     echo "  python3 $script $input $out $args"
-    python3 "$script" "$input" "$out" $args || { echo "  $s FAILED for run $run" >&2; rc=1; }
+    python3 "$script" "$input" "$out" $args < /dev/null || { echo "  $s FAILED for run $run" >&2; rc=1; }
   done
-done < <(sed -n "${first},${last}p" "$RUNLIST")
+done 3< <(sed -n "${first},${last}p" "$RUNLIST")
 
 echo "task $SLURM_ARRAY_TASK_ID finished with status $rc at $(date)"
 exit $rc
